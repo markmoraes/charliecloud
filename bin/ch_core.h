@@ -18,6 +18,16 @@ enum bind_dep {
    BD_OPTIONAL   // if either source or destination missing, do nothing
 };
 
+struct squash {
+   char *filepath;        // path of sqfs file
+   char *mountdir;        //location where squashfs is mounted
+   pid_t pid;             // process id of the fuse loop
+   struct fuse_chan *ch;  //fuse channel associated with squash fuse session
+   struct fuse *fuse;     //fuse struct associated with squash fuse session
+   char *parentdir;   //location of mountpoint parent directory
+};
+
+
 struct container {
    struct bind *binds;
    bool ch_ssh;          // bind /usr/bin/ch-ssh?
@@ -33,16 +43,9 @@ struct container {
    bool private_tmp;     // don't bind host's /tmp
    char *old_home;       // host path to user's home directory (i.e. $HOME)
    bool writable;
+   struct squash *sq;
 };
 
-struct squash {
-   char *filepath;        // path of sqfs file
-   char *mountdir;        //location where squashfs is mounted
-   pid_t pid;             // process id of the fuse loop
-   struct fuse_chan *ch;  //fuse channel associated with squash fuse session
-   struct fuse *fuse;     //fuse struct associated with squash fuse session
-   char *parentdir;	  //location of mountpoint parent directory
-};
 
 extern struct squash *s;
 /** Function prototypes **/

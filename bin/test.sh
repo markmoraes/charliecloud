@@ -42,4 +42,10 @@ mount | grep -F fuse
 echo "CLEANUP:none :)"
 
 
+echo "----------------------------------------------------------------------------------------"
 
+echo "CASE 3: Original workflow"
+
+$HOME/charliecloud/bin/ch-mount $HOME/chorkshop/$1.sqfs /var/tmp
+./ch-run /var/tmp/$1 -- ./hello.py
+$HOME/charliecloud/bin/ch-umount /var/tmp/$1

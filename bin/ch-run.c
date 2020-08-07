@@ -105,8 +105,6 @@ struct timespec start, finish;
 
 int main(int argc,char *argv[])
 {
-   //FOR TESTING CH-MOUNT
-   //clock_gettime(CLOCK_MONOTONIC, &start);  
    bool argp_help_fmt_set;
    int c_argc;
    char ** c_argv;
@@ -117,7 +115,12 @@ int main(int argc,char *argv[])
 
    verbose = 1;  // in charliecloud.h
    
-   sq = (struct squash) {.filepath = NULL, .mountdir = NULL, .pid = 0, .ch = NULL, .fuse = NULL, .parentdir = "/var/tmp", };
+   sq = (struct squash) {.filepath = NULL,
+                         .mountdir = NULL,
+                         .pid = 0,
+                         .ch = NULL,
+                         .fuse = NULL,
+                         .parentdir = "/var/tmp"};
    args = (struct args){ .c = (struct container){ .ch_ssh = false,
                                                   .container_gid = getegid(),
                                                   .container_uid = geteuid(),
@@ -132,6 +135,7 @@ int main(int argc,char *argv[])
                                                   .old_home = getenv("HOME"),
                                                   .writable = false },
                          .initial_dir = NULL };
+   args.c.sq = &sq;
    // These need to be on the heap because we realloc(3) them later.
    T_ (args.c.binds = calloc(1, sizeof(struct bind)));
    T_ (args.env_deltas = calloc(1, sizeof(struct env_delta)));
@@ -457,7 +461,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
       args->c.writable = true;
       break;
    case 's':
-        sq.parentdir = arg;
+        args->c.sq->parentdir = arg;
         break;
    case ARGP_KEY_NO_ARGS:
       argp_state_help(state, stderr, (  ARGP_HELP_SHORT_USAGE
@@ -476,21 +480,15 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
  * if no mount directory specified, /var/tmp is passed */
 void goSquash(char *arg, char ** filepath)
 {
-   sq.filepath = *filepath;
-   char * filename = strtok(basename(strdup(sq.filepath)), ".");
+   args.c.sq->filepath = *filepath;
+   char * filename = strtok(basename(strdup(args.c.sq->filepath)), ".");
    char * buffer = (char *) malloc(strlen(arg) + strlen(filename));
    strcpy(buffer,arg);
-   sq.mountdir = strcat(strcat(buffer,"/"),filename);
-   *filepath=sq.mountdir;
-   s=&sq;
-   squashmount(&sq);
+   args.c.sq->mountdir = strcat(strcat(buffer,"/"),filename);
+   *filepath=args.c.sq->mountdir;
+   s=args.c.sq;
+   squashmount(args.c.sq);
    
-   //FOR TESTING CH_MOUNT
-   //clock_gettime(CLOCK_MONOTONIC, &finish);
-   //double time = finish.tv_sec - start.tv_sec;
-   //time += ((finish.tv_nsec - start.tv_nsec) / 1000000000.0);
-   //printf("mount %f\n", time); 
-
 }
 
 /* Validate that the UIDs and GIDs are appropriate for program start, and

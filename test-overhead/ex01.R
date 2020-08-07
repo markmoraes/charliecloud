@@ -1,6 +1,7 @@
 ################### LIBRARIES #####################################
 library(dplyr)
 library(tidyr)
+library(ggplot2)
 
 #################### Helpers######################################
 
@@ -38,3 +39,5 @@ all %>% gather(key,value,-size) %>%
     summarize(meantime= mean(value)) %>%
     ggplot(aes(x=size,y=meantime,color=key)) + geom_point() + geom_smooth()
 
+all %>% gather(key,value,-size) %>%
+    ggplot(aes(x=size,y=value,fill=key)) + geom_boxplot()

@@ -3,6 +3,11 @@ library(ggplot2)
 library(reshape2)
 require(graphics)
 
+
+colors <- c("#ba9bc9","#f2c9ee","#7575ac","#6b82b8","#f5cec1","#fbf9ed")
+palette(colors)
+
+
 e2e <- read.csv('giggles.csv')
 # Plot End to End Times Raw
 e2e <- e2e %>%
