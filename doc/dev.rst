@@ -1254,12 +1254,397 @@ Additional sources
 * :code:`runc create` man page: https://raw.githubusercontent.com/opencontainers/runc/master/man/runc-create.8.md
 * https://github.com/opencontainers/runtime-spec/blob/master/runtime.md
 
-..  LocalWords:  milestoned gh nv cht Chacon's scottchacon
 
-ch-grow cache design
-====================
+:code:`ch-grow` caching
+=======================
 
-This section will describe the design principles governing ch-grow layer caching. 
+Like most container image builders, :code:`ch-grow` uses caching to save time
+and download quotas. There are two separate caches:
+
+1. Download cache: Files downloaded during image pull, e.g. manifest and
+   layer tarballs. This is a directory containing plain files.
+
+2. Layer cache: Results of instruction execution during Dockerfile
+   interpretation. This is managed using Git.
+
+Note that everything in this section is internal documentation and is not part
+of any public interface, unless otherwise stated.
+
+Storage directory layout
+------------------------
+
+The caches and all the other state :code:`ch-grow` cares about go in the
+storage directory. It contains these subdirectories:
+
+* :code:`dlcache`: Download cache.
+
+* :code:`lycache`: Layer cache Git repository.
+
+* :code:`img`: Unpacked images used for building, one per subdirectory.
+
+The default location of the storage directory is
+:code:`/var/tmp/$USER/ch-grow`. Reasoning:
+
+* :code:`/var/tmp` is a temporary directory that is (1) often larger and more
+  persistent than :code:`/tmp` and (2) not bind-mounted by default into
+  Charliecloud containers like :code:`/tmp` is.
+
+* Subdirectory :code:`$USER` isolates one user's :code:`ch-grow` activity from
+  others on the same machine.
+
+* Subdirectory :code:`ch-grow` isolates :code:`ch-grow` activity from
+  unrelated temporary files owned by :code:`$USER`.
+
+Download cache
+--------------
+
+The files downloaded during pull (manifest, layers, etc.) are saved as plain
+files in this directory. If a file is present here, we use it instead of
+downloading a new one.
+
+Layer cache
+-----------
+
+The layer cache is stored as Git repository. There is a single bare Git
+repository in :code:`lycache`, which has multiple working directories, one per
+image, in subdirectories of :code:`img`.
+
+Priorities for the layer cache are, in descending order: (1) correctness and
+repeatability, (2) clarity of implementation, (3) time efficiency, (4) space
+efficiency.
+
+Key concepts
+~~~~~~~~~~~~
+
+*Relationships between layers.* Layers form a tree; each layer corresponds to
+exactly one node and has exactly one parent layer. The root is a pseudo-layer
+that is empty. (This lets us set up everything as a tree instead of a forest.)
+
+*Identifying a layer.* A layer is identified by its *layer ID*. Typically
+represented as a hex string, this ID is the hash of the parent's ID
+concatenated with instruction-specific data. We use the MD5 hash to emphasize
+that the cache has not been hardened against malicious activity; despite its
+cryptographic weaknesses, MD5 still has negligible risk of accidental
+collisions.
+
+Parent and ID for each type of layer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ID is the hash of the parent's hash (binary, not the hex string) followed
+by the *hash input* as stated. All hash elements are concatenated with no
+delimiters, e.g. with one :code:`update()` call per element.
+
+Hash computations require bytes as input. Objects that have a byte sequence
+view are inserted with that view; strings are UTF-8 encoded; other objects are
+converted to strings with :code:`repr()`.
+
+root "layer"
+  No parent; ID is 52494557594c41444f4b4e4143495600.
+
+pulled layer
+  Parent is the root. Hash input is the manifest file content, as bytes. This
+  will catch changes in upstream layers or metadata, but (importantly) not the
+  image name or tags.
+
+  We store the unpacked image as a single layer, even if the repository image
+  contains multiple layers, so that we don't need to manage upstream layers in
+  our tree. (This may change in the future.)
+
+Dockerfile instructions
+  Parent is the previous instruction (except for :code:`FROM` — see below). By
+  default, hash input starts with the instruction name
+  (:code:`self.str_name()`), the stringified options
+  (:code:`self.options_str`), and the instruction's string representation of
+  itself (:code:`self.str_()`). Some instructions have additional input, and a
+  few change these defaults, as listed below.
+
+:code:`ARG` and :code:`ENV`
+  Additional hash input is the variable name and then the value being set,
+  UTF-8 encoded. (While the :code:`ENV` syntax supports multiple variables set
+  on the same line, internally this is represented as multiple instructions.)
+
+  For :code:`ARG`, if the variable name is one of the proxy variables excluded
+  from caching in :code:`ch-grow(1)`, there is no additional hash input.
+
+:code:`COPY`
+  Additional hash input is first the destination path, then basic metadata of
+  all the source files (this contrasts with Docker, which uses file contents).
+  Using a breadth-first, in-order search, for each directory entry, we hash:
+  filename (as specified for sources, otherwise name in directory), file type
+  and permissions, size, and last modified time.
+
+  This has two key implications:
+
+    1. It is possible to change a source file and still hit the cache.
+       However, we expect this is hard to do accidentally.
+
+    2. :code:`COPY` does a lot of I/O even on cache hit (though not as much as
+       reading all the file content), because it must :code:`stat(2)` every
+       file in the source before it can even look in the cache. (This may
+       change in the future. For example, we could first hash just the text of
+       the instruction; if that's not present, we know it's a miss. If it is
+       present, we could check a second hash that contains the rest of the
+       input.)
+
+:code:`FROM`
+
+  Because :code:`FROM` copies an image, it has the same layer ID and parent ID
+  as the base image; there is no hash computation.
+
+Unsupported instructions have no effect on the cache, because they have no
+effect on the image.
+
+Basic algorithm summaries
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Layer IDs are stored in two places:
+
+  1. As a key-value pair in the Git commit message, e.g.::
+
+       Layer-ID: 52494557594c41444f4b4e4143495600
+
+     This lets us map a layer ID to a Git commit (with :code:`git log --grep
+     -F`; this will always yield a single commit) and also walk the Git tree
+     to get the parent ID. (Note: Because Git commit hashes contain timestamp
+     information and have different input than layer IDs, there is no stable
+     map between layer IDs and commit hashes.)
+
+  2. In file :code:`/ch/layer-id` in the image, e.g.::
+
+       $ cat ch/layer-id
+       52494557594c41444f4b4e4143495600
+
+     This lets us get the layer ID corresponding to an unpacked image. (Note:
+     This is not necessarily the newest layer ID for a given image name.)
+
+To initialize the cache:
+
+  1. Create a new bare Git repo in :code:`lycache`.
+  2. Check in an empty commit with the root layer ID.
+
+To pull image :code:`foo`:
+
+  1. Download manifest, layers, etc. (or take them from the download cache).
+
+  2. Compute layer ID.
+
+  3. If layer ID is in the Git repo (cache hit):
+
+     1. If :code:`img/foo` exists and has the right layer ID, we are done.
+
+     2. If it exists and has the wrong layer ID, remove it.
+
+     3. Create :code:`img/foo` using :code:`git worktree new`, specifying the
+        commit matching the cached layer ID.
+
+  4. Otherwise, it is a cache miss.
+
+     1. Create :code:`img/foo` using :code:`git worktree new`, specifying the
+        commit for the empty root pseudo-layer.
+
+     2. Unpack the layers into the this subdirectory.
+
+     3. Compute the layer ID and commit.
+
+To create a new image :code:`bar` with :code:`FROM foo`:
+
+  1. If :code:`img/foo` does not exist, pull it. We now have a guaranteed
+     cache hit.
+  2. Create :code:`img/bar` using :code:`git worktree new`, specifying the
+     commit for the layer ID of :code:`img/foo`.
+
+To execute sequence of instructions, starting after :code:`FROM`:
+
+  1. Set the most recent hit ID to the layer ID of the :code:`FROM`.
+
+  2. For each instruction:
+
+     1. Compute the layer ID.
+
+     2. If the layer ID is in the cache (a hit), set the most recent hit ID to
+        that ID.
+
+     3. Otherwise, it's a cache miss. (Note that as soon as one instruction
+        misses, the rest of the sequence will too.) Then:
+
+        1. If it's not the first instruction, check out the commit of the most
+           recent hit ID. (If it's the first, it will already be checked out;
+           verify this.)
+
+        2. Execute the instruction.
+
+        3. Check in the image.
+
+  3. If we got to the end of the sequence without any misses, check out the
+     most recent hit ID.
+
+Note: Any OOB manipulation of the unpacked images will cause cache corruption
+because what's in the image does not match the recorded procedure (pulls and
+instructions) that got there.
+
+FAQ
+---
+
+Why Git and not a purpose-built solution like OSTree?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A key philosophy of Charliecloud is to use standard tools whenever possible,
+to make things more understandable and discoverable.
+
+In our examination of how we could set up a layer cache, the only competitive
+alternate was `OSTree <https://ostree.readthedocs.io/en/latest/>`_ (a.k.a.
+libostree). Unfortunately, OSTree is not well documented nor widely used. In
+contrast, Git is enormously widely used and well understood by a large number
+of developers. This makes it a better choice for us even though in terms of
+features it is a weaker match.
+
+What about file metadata and directories?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Git `does not store <https://stackoverflow.com/questions/45578579>`_ file
+metadata, and directories are stored implicitly, so empty directories get
+lost.
+
+We have not yet integrated it into the algorithms above, but the basic
+approach is to precede commit with a gathering of metadata (perhaps using
+:code:`os.walk()` and :code:`os.stat()`) and serialize this data structure
+stored in the image at (e.g.) :code:`/ch/metadata`. Then it will be captured
+by the commit. Following a checkout, we restore metadata.
+
+FIXME: What file types are stored by Git that we want to allow? What do we do
+if we encounter bad file types? Should put this in user-facing docs.
+
+Is :code:`git log --grep` fast enough?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+AFAICT, this is a linear search scaling by the number of commits, which in our
+case will be roughly number of instructions executed plus images pulled.
+
+On the Charliecloud repo::
+
+  $ git log --reflog --format=format:%H | wc -l
+  1300
+  $ clear-disk-cache > /dev/null
+  $ time git log --grep foo -F --reflog --format=format:%H > /dev/null
+
+  real	0m0.102s
+  user	0m0.018s
+  sys	0m0.009s
+  $ time git log --grep foo -F --reflog --format=format:%H > /dev/null
+
+  real	0m0.017s
+  user	0m0.000s
+  sys	0m0.018s
+
+On :code:`linux-stable`::
+
+  $ git log --reflog --format=format:%H | wc -l
+  1158461
+  $ clear-disk-cache > /dev/null
+  $ time git log --grep foo -F --reflog --format=format:%H > /dev/null
+
+  real	0m25.815s
+  user	0m16.098s
+  sys	0m2.073s
+  $ time git log --grep foo -F --reflog --format=format:%H > /dev/null
+
+  real	0m17.178s
+  user	0m16.028s
+  sys	0m1.133s
+
+So I don't think we need to be too worried, but we could keep an eye on things
+(e.g. :code:`DEBUG` performance numbers).
+
+Note, we can probably speed this up with :code:`-n1` (return only one commit)
+but we risk not catching a corrupted cache with multiple commits for the same
+layer ID.
+
+How does :code:`--no-cache` work?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It's important that we are able to pull and build while bypassing the cache,
+in order to re-do computations that have side effects. However, there are two
+caches:
+
+1. download cache
+2. layer cache
+
+and two different no-cache operations:
+
+1. don't retrieve things from the cache
+2. don't insert new things into the cache
+
+Proposal:
+
+* :code:`--no-cache=dl`: don't retrieve things from the download cache, but do
+  add new things
+* :code:`--no-cache=ly`: don't retrieve layers from the layer cache, but do
+  add new layers
+* :code:`--no-cache=read` or bare :code:`--no-cache`: both of the above
+
+**FIXME**
+
+* Does this create duplicate layer IDs in the Git repo? How do we deal
+  with that?
+
+* Maybe we want to put the layer IDs in tags rather than the commit message,
+  so we can remove it? But that's a lot of tags! Is Git prepared to deal with
+  a tag for every commit? It will prevent anything from being
+  garbage-collected, too.
+
+* Maybe we just pick the most recent commit having a certain layer ID? What
+  are the implications of that? E.g., say we build images A and B, both of
+  which contain layer C half-way through. Then we re-build image B with
+  :code:`--no-cache`. What happens when we've re-built layer C? It will have
+  the same layer ID but may be different (e.g., :code:`RUN date > foo`). Image
+  A should keep the old C but image B should get the new C.
+
+* Maybe we use a tag for each image, and search for layer IDs only along the
+  ancestors of that tag. This could speed up :code:`git log --grep` too maybe?
+  What about Git branches?
+
+Can you run multiple builds or pulls at the same time?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No. (But if we assume this, smells like trouble later when we try to add it,
+as that's a hard assumption to reverse.)
+
+Why not use Git hashes instead of our own?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+They include timestamps, which we don't want.
+
+What about images with multiple tags?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+FIXME. But I think we can put this off. We certainly don't want to duplicate
+an entire image if it gets an alias.
+
+How does the cache interact with Git garbage collection and reflog?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+FIXME.
+
+Do we want a :code:`ch-grow storage-reset` and/or :code:`ch-grow
+layer-cache-gc`?
+
+Are layer IDs stable across Charliecloud versions?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No. But the consequence of this should be extra cache misses, which is an
+acceptable cost.
+
+How do we indicate what versions of :code:`ch-grow` the storage directory is compatible with?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+FIXME.
+
+
+Rusty's stuff I (FIXME)
+-----------------------
+
+This section will describe the design principles governing ch-grow layer
+caching.
 
 Differences from Docker 
 -----------------------
@@ -1289,3 +1674,7 @@ When we have a cache miss we :code:`invalidate` the cache, pull down the last go
 Metadata
 --------
 Git does not store metadata for permissions. We store this information using <need to work this out>.
+
+
+..  LocalWords:  milestoned gh nv cht Chacon's scottchacon img dlcache mtime
+..  LocalWords:  lycache worktree OOB OSTree libostree gc
