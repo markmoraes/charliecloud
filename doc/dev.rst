@@ -1327,12 +1327,27 @@ that the cache has not been hardened against malicious activity; despite its
 cryptographic weaknesses, MD5 still has negligible risk of accidental
 collisions.
 
+Layer IDs are *not unique* across the entire layer cache; they are unique only
+for a given image name. This is because they depend only on (a subset of)
+layer metadata, not the complete results of the instruction, which can contain
+side effects (e.g., :code:`RUN date > foo`). Otherwise, we could not compute
+the layer ID without executing the instruction, which defeats the point of the
+cache; i.e., an instruction executed twice will get the same layer ID but may
+have produced different results, and we can't tell ahead of time.
+
+For example, suppose we build images A and B, both of which contain layer C
+part-way through. Then, we rebuild image B with :code:`--no-cache`. We will
+re-build layer C, which will get the same layer ID as before but may be
+different. Image A should keep the old C but image B should get the new C. If
+we start the search for C from either A or B depending on what we care about,
+then everything is OK even with two C's.
+
 Parent and ID for each type of layer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The ID is the hash of the parent's hash (binary, not the hex string) followed
-by the *hash input* as stated. All hash elements are concatenated with no
-delimiters, e.g. with one :code:`update()` call per element.
+by the *hash input* as stated below. All hash elements are concatenated with
+no delimiters, e.g. with one :code:`update()` call per element.
 
 Hash computations require bytes as input. Objects that have a byte sequence
 view are inserted with that view; strings are UTF-8 encoded; other objects are
@@ -1376,7 +1391,8 @@ Dockerfile instructions
   This has two key implications:
 
     1. It is possible to change a source file and still hit the cache.
-       However, we expect this is hard to do accidentally.
+       However, we expect this is hard to do accidentally, because one would
+       have to manually put the last-modified date back.
 
     2. :code:`COPY` does a lot of I/O even on cache hit (though not as much as
        reading all the file content), because it must :code:`stat(2)` every
@@ -1397,6 +1413,12 @@ effect on the image.
 Basic algorithm summaries
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
+For each unpacked image *foo*, there is also at most one Git commit tagged
+*foo*. This lets us walk the layer history of the image, by ascending the
+commit tree. If there is no such commit, that means the image was built
+without writing to the cache. (We use Git tags rather than branches to avoid
+introducing a second layer of branching semantics.)
+
 Layer IDs are stored in two places:
 
   1. As a key-value pair in the Git commit message, e.g.::
@@ -1404,18 +1426,17 @@ Layer IDs are stored in two places:
        Layer-ID: 52494557594c41444f4b4e4143495600
 
      This lets us map a layer ID to a Git commit (with :code:`git log --grep
-     -F`; this will always yield a single commit) and also walk the Git tree
-     to get the parent ID. (Note: Because Git commit hashes contain timestamp
-     information and have different input than layer IDs, there is no stable
-     map between layer IDs and commit hashes.)
+     -F GIT_TAG`; this will always yield a single commit) and also walk the
+     Git tree to get the parent ID.
 
   2. In file :code:`/ch/layer-id` in the image, e.g.::
 
        $ cat ch/layer-id
        52494557594c41444f4b4e4143495600
 
-     This lets us get the layer ID corresponding to an unpacked image. (Note:
-     This is not necessarily the newest layer ID for a given image name.)
+     This is not strictly necessary, because we can get the layer ID for an
+     unpacked image by looking at the tagged Git commit, but it lets us do a
+     consistency check.
 
 To initialize the cache:
 
@@ -1428,30 +1449,39 @@ To pull image :code:`foo`:
 
   2. Compute layer ID.
 
-  3. If layer ID is in the Git repo (cache hit):
+  3. If (a) not :code:`--no-cache=ly-write`, (b) Git tag :code:`foo` exists,
+     and (c) the layer ID at that tag matches what we computed, that's a cache
+     hit. The existing directory is what we wanted and we are done.
 
-     1. If :code:`img/foo` exists and has the right layer ID, we are done.
+     Note: We verify here the following inconsistent cache conditions:
 
-     2. If it exists and has the wrong layer ID, remove it.
-
-     3. Create :code:`img/foo` using :code:`git worktree new`, specifying the
-        commit matching the cached layer ID.
+       * Existing directory's layer ID does not match.
+       * No existing directory.
 
   4. Otherwise, it is a cache miss.
 
-     1. Create :code:`img/foo` using :code:`git worktree new`, specifying the
-        commit for the empty root pseudo-layer.
+     1. If Git tag :code:`foo` exists, remove it.
 
-     2. Unpack the layers into the this subdirectory.
+     2. If :code:`img/foo` exists, remove it. If it has any layer ID, that
+        should match what was in the Git tag, or the cache is inconsistent.
 
-     3. Compute the layer ID and commit.
+     3. Create :code:`img/foo`. If :code:`--no-cache=ly-write`, create an
+        empty directory. Otherwise, use :code:`git worktree new`, specifying
+        the commit for the empty root pseudo-layer.
+
+     4. Unpack the layers into the this subdirectory.
+
+     5. Commit and tag.
 
 To create a new image :code:`bar` with :code:`FROM foo`:
 
-  1. If :code:`img/foo` does not exist, pull it. We now have a guaranteed
-     cache hit.
-  2. Create :code:`img/bar` using :code:`git worktree new`, specifying the
-     commit for the layer ID of :code:`img/foo`.
+  1. If :code:`img/foo` does not exist, pull it.
+
+  2. If :code:`--no-cache=ly-write`, copy :code:`img/foo` to :code:`img/bar`,
+     excluding :code:`img/foo/.git`.
+
+  3. Else :code:`git worktree new`, specifying the commit for the layer ID of
+     :code:`img/foo`, and delete the Git tag :code:`bar`.
 
 To execute sequence of instructions, starting after :code:`FROM`:
 
@@ -1473,7 +1503,7 @@ To execute sequence of instructions, starting after :code:`FROM`:
 
         2. Execute the instruction.
 
-        3. Check in the image.
+        3. Check in and tag the image.
 
   3. If we got to the end of the sequence without any misses, check out the
      most recent hit ID.
@@ -1491,12 +1521,12 @@ Why Git and not a purpose-built solution like OSTree?
 A key philosophy of Charliecloud is to use standard tools whenever possible,
 to make things more understandable and discoverable.
 
-In our examination of how we could set up a layer cache, the only competitive
-alternate was `OSTree <https://ostree.readthedocs.io/en/latest/>`_ (a.k.a.
-libostree). Unfortunately, OSTree is not well documented nor widely used. In
-contrast, Git is enormously widely used and well understood by a large number
-of developers. This makes it a better choice for us even though in terms of
-features it is a weaker match.
+In our planning of the layer cache, the only competitive alternate was `OSTree
+<https://ostree.readthedocs.io/en/latest/>`_ (a.k.a. libostree).
+Unfortunately, OSTree is not well documented nor widely used. In contrast, Git
+is enormously widely used and well understood by a large number of developers.
+This makes it a better choice for us even though in terms of features it is a
+weaker match.
 
 What about file metadata and directories?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1517,8 +1547,11 @@ if we encounter bad file types? Should put this in user-facing docs.
 Is :code:`git log --grep` fast enough?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-AFAICT, this is a linear search scaling by the number of commits, which in our
-case will be roughly number of instructions executed plus images pulled.
+I believe this is a linear search scaling by the number of commits walked,
+which in our case will be roughly number of instructions executed since the
+root empty image. This is not very many.
+
+However, below are some much bigger searches.
 
 On the Charliecloud repo::
 
@@ -1574,40 +1607,42 @@ and two different no-cache operations:
 1. don't retrieve things from the cache
 2. don't insert new things into the cache
 
-Proposal:
+**Proposal:**
 
-* :code:`--no-cache=dl`: don't retrieve things from the download cache, but do
-  add new things
-* :code:`--no-cache=ly`: don't retrieve layers from the layer cache, but do
-  add new layers
-* :code:`--no-cache=read` or bare :code:`--no-cache`: both of the above
+:code:`--no-cache[=OPS]`, where :code:`OPS` is a comma-separated list of
+things saying what not to do:
 
-**FIXME**
+  * :code:`dl-read`:  retrieve things from the download cache
+  * :code:`dl-write`: insert new things into the download cache
+  * :code:`ly-read`:  retrieve things from the layer cache
+  * :code:`ly-write`: insert new things into the layer cache
+  * :code:`dl-all`:   equivalent to :code:`dl-read,dl-write`
+  * :code:`ly-all`:   equivalent to :code:`ly-read,ly-write`
+  * :code:`read`:     equivalent to :code:`dl-read,ly-read`
+  * :code:`write`:    equivalent to :code:`dl-write,ly-write`
+  * :code:`all`:      equivalent to :code:`read,write`
 
-* Does this create duplicate layer IDs in the Git repo? How do we deal
-  with that?
+If :code:`OPS` is not specified, then the default is :code:`read`.
 
-* Maybe we want to put the layer IDs in tags rather than the commit message,
-  so we can remove it? But that's a lot of tags! Is Git prepared to deal with
-  a tag for every commit? It will prevent anything from being
-  garbage-collected, too.
+The implementation is straightforward:
 
-* Maybe we just pick the most recent commit having a certain layer ID? What
-  are the implications of that? E.g., say we build images A and B, both of
-  which contain layer C half-way through. Then we re-build image B with
-  :code:`--no-cache`. What happens when we've re-built layer C? It will have
-  the same layer ID but may be different (e.g., :code:`RUN date > foo`). Image
-  A should keep the old C but image B should get the new C.
+  * :code:`read`: Don't check the cache, and assume a cache miss.
+  * :code:`write`: Skip the cache update option.
 
-* Maybe we use a tag for each image, and search for layer IDs only along the
-  ancestors of that tag. This could speed up :code:`git log --grep` too maybe?
-  What about Git branches?
+Note that in neither case do we remove anything from the cache. For example,
+if we build (1) normally, (2) again with :code:`--no-cache=ly-all`, and then
+(3) again normally, the third build will pick up the cached results from the
+first build.
+
+If Git is not installed, then the default is :code:`--no-cache=all` and
+everything should work normally.
 
 Can you run multiple builds or pulls at the same time?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-No. (But if we assume this, smells like trouble later when we try to add it,
-as that's a hard assumption to reverse.)
+Probably not currently. But, all the algorithms are designed with the
+assumption of exclusive access only to the images being operated on, so
+hopefully this will not be too hard to change later.
 
 Why not use Git hashes instead of our own?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1617,16 +1652,17 @@ They include timestamps, which we don't want.
 What about images with multiple tags?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-FIXME. But I think we can put this off. We certainly don't want to duplicate
-an entire image if it gets an alias.
+This is not yet implemented.
 
-How does the cache interact with Git garbage collection and reflog?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+How does the cache interact with Git garbage collection?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-FIXME.
+Anything not an ancestor of a tagged image may be garbage collected by Git.
+Note that as soon as the tag is removed, all those commits are inaccessible to
+:code:`ch-grow` (i.e., will not cause cache hits).
 
-Do we want a :code:`ch-grow storage-reset` and/or :code:`ch-grow
-layer-cache-gc`?
+FIXME: Do we want a :code:`ch-grow storage-reset` and/or :code:`ch-grow
+storage-gc`?
 
 Are layer IDs stable across Charliecloud versions?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1677,4 +1713,4 @@ Git does not store metadata for permissions. We store this information using <ne
 
 
 ..  LocalWords:  milestoned gh nv cht Chacon's scottchacon img dlcache mtime
-..  LocalWords:  lycache worktree OOB OSTree libostree gc
+..  LocalWords:  lycache worktree OOB OSTree libostree gc dl ly
