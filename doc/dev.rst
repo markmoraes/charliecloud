@@ -1310,7 +1310,7 @@ repository in :code:`lycache`, which has multiple working directories, one per
 image, in subdirectories of :code:`img`.
 
 Priorities for the layer cache are, in descending order: (1) correctness and
-repeatability, (2) clarity of implementation, (3) time efficiency, (4) space
+repeatability, (2) clarity to users, (3) clear code implementation, (3) time efficiency, (4) space
 efficiency.
 
 Key concepts
@@ -1347,7 +1347,7 @@ Parent and ID for each type of layer
 
 The ID is the hash of the parent's hash (binary, not the hex string) followed
 by the *hash input* as stated below. All hash elements are concatenated with
-no delimiters, e.g. with one :code:`update()` call per element.
+no delimiters, e.g. with one python hashlib :code:`update()` call per element.
 
 Hash computations require bytes as input. Objects that have a byte sequence
 view are inserted with that view; strings are UTF-8 encoded; other objects are
@@ -1361,7 +1361,7 @@ pulled layer
   will catch changes in upstream layers or metadata, but (importantly) not the
   image name or tags.
 
-  We store the unpacked image as a single layer, even if the repository image
+  We store the unpacked image as a single layer. A layer is represented by a single filesytem tree. Even if the repository image
   contains multiple layers, so that we don't need to manage upstream layers in
   our tree. (This may change in the future.)
 
@@ -1674,43 +1674,6 @@ How do we indicate what versions of :code:`ch-grow` the storage directory is com
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 FIXME.
-
-
-Rusty's stuff I (FIXME)
------------------------
-
-This section will describe the design principles governing ch-grow layer
-caching.
-
-Differences from Docker 
------------------------
-The ch-grow cache works much like docker with a few caveats. 
-
-1) Our algorithms is intended to be less aggressive than Docker's 
-2) We invalidate the cache when we run an ADD or COPY instruction eventually we'd like this to do a smart check.
-3) ch-grow does not implement some docker instructions; therefore, these instructions will not be cached. 
-
-Caching
--------
-
-ch-grow cache uses git to cache image layers. As such, ch-grow caching adds git as a dependency. 
-The entire cache is one large git repository stored in the :code:`$CH_GROW_STORAGE/img` directory. 
-
-ch-grow caches layers across all images built with a particular base image. For each base image, we have an associated git branch defined by it's image_id. At any one time, there is one build associated with each base image that's the :code:`canonical build`. This is the image which all future images will be compared against when caching.When we build a Dockerfile with a new base image that has not yet been cached, we create a new branch in the git repo using the :code:`image_id` as the branch name.
-
-An :code:`image_id` is the SHA256 hash of a string containing the image name appended with the dockerhub digest for the particular image. As an example, let's consider the base image :code:`debian:stretch` in a Dockerfile that begins with :code:`FROM debian:stretch`. The image_id for this base image would be :code:`hash(digest + debian:stretch)`. This lets us quickly check if the base image :code:`debian:stretch` has changed during subsequent builds so we can promptly invalidate the cache. 
-
-We add each layer created through successive instructions as a new commit to the base image's branch. Each layer commit has an associated comment containing the layer's :code:`layer_id`. The :code:`layer_id` is a SHA256 hash of the instruction appended to the hash of the previous instruction. Continuing from the last example, :code:`debian:stretch`. If the next instruction in the Dockerfile is :code:`RUN apt update`, the :code:`layer_id` will be :code:`hash("RUN apt update" + image_id)`. 
-
-The first instruction will always append the :code:`image_id` while latter instructions will use the previous :code:`layer_id`. Building the layers this way enables us to keep track of the order of instructions within a Dockerfile for free. The first layer will always contain the image's entire file system tree while later layers track the differences created when running instructions. The first build will immediately be the :code:`canonical build` for the base image. 
-
-Upon subsequent builds, we check if each instruction is in the cache by computing a :code:`layer_id` and search for a git commit with that comment. All comparisons will be made against the :code:`canonical build`. When we have a cache hit, we simply take note of the :code:`layer_id` and keep going. We use a *lazy* approach to caching in which we only pull down a layer from the cache when there are no instructions left or we have a cache miss.
-When we have a cache miss we :code:`invalidate` the cache, pull down the last good layer, and add all subsequent instructions to the cache. The newly built image becomes the new :code:`canonical build` for its base image.
-
-Metadata
---------
-Git does not store metadata for permissions. We store this information using <need to work this out>.
-
 
 ..  LocalWords:  milestoned gh nv cht Chacon's scottchacon img dlcache mtime
 ..  LocalWords:  lycache worktree OOB OSTree libostree gc dl ly
