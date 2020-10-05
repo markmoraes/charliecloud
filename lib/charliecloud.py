@@ -436,7 +436,7 @@ nogroup:x:65534:
    def pull_to_unpacked(self, use_cache=True, fixup=False):
       """Pull and flatten image. If fixup, then also add the Charliecloud
          workarounds to the image directory."""
-      self.download(use_cache, arch)
+      self.download(use_cache)
       self.flatten()
       if (fixup):
          self.fixup()
