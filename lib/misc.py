@@ -33,6 +33,16 @@ class Version(Action_Exit):
 # Argument: command line arguments Namespace. Do not need to call sys.exit()
 # because caller manages that.
 
+def delete(cli):
+   ch.dependencies_check()
+   imgdir   = cli.storage + '/img'
+   image    = os.path.join(imgdir, cli.image_ref.replace("/", "%"))
+   if (not os.path.isdir(image)):
+      ch.INFO("no such image in storage: '%s'" % cli.image_ref)
+   else:
+      ch.rmtree(image)
+      ch.INFO("done")
+
 def list_(cli):
    ch.dependencies_check()
    imgdir = cli.storage + '/img'
@@ -68,6 +78,26 @@ def pull(cli):
    image.pull_to_unpacked(use_cache=(not cli.no_cache))
    # Done.
    ch.INFO("done")
+
+def rename(cli):
+   ch.dependencies_check()
+   imgdir   = cli.storage + '/img'
+   image    = os.path.join(imgdir, cli.image_ref.replace("/", "%"))
+   ch.ossafe( os.path.isdir, "no such image: %s" % cli.image_ref, image)
+
+   cachedir = cli.storage + '/dlcache'
+   manifest = os.path.join(cachedir, cli.image_ref + '.manifest.json' )
+   ch.ossafe( os.path.exists, "no such manifest: %s",
+              cli.image_ref + '.manifest.json' )
+
+   new_name = os.path.join(imgdir, cli.name.replace("/", "%"))
+   ch.DEBUG("renaming: '%s' to '%s'" % (image, new_name))
+   ch.ossafe( os.rename, "can't rename: %s" % cli.image_ref, image, new_name)
+
+   # FIXME: should this also change the name of the manifest?
+   new_manifest = os.path.join(cachedir, cli.name + '.manifest.json')
+   ch.DEBUG("renaming: '%s' to '%s'" % (manifest, new_manifest))
+   ch.ossafe(os.rename, "can't rename: %s" % cli.image_ref, manifest, new_manifest)
 
 def storage_path(cli):
    print(cli.storage)

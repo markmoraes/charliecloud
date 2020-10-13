@@ -121,6 +121,14 @@ def main():
    sp.add_argument("context", metavar="CONTEXT",
                    help="context directory")
 
+   # delete
+   help="delete an image from storage"
+   sp = sps.add_parser("delete", help=help, description=help,
+                       formatter_class=ch.HelpFormatter)
+   sp.set_defaults(func=misc.delete)
+   add_opts(sp, common_opts, True)
+   sp.add_argument("image_ref", metavar="IMAGE_REF", help="image reference")
+
    # list
    help="list images in storage"
    sp = sps.add_parser("list", help=help, description=help,
@@ -139,6 +147,15 @@ def main():
    sp.add_argument("image_ref", metavar="IMAGE_REF", help="image reference")
    sp.add_argument("image_dir", metavar="IMAGE_DIR", nargs="?",
                    help="unpacked image path (default: opaque path in storage dir)")
+
+   # rename
+   help="rename image in storage"
+   sp = sps.add_parser("rename", help=help, description=help,
+                        formatter_class=ch.HelpFormatter)
+   sp.set_defaults(func=misc.rename)
+   add_opts(sp, common_opts, True)
+   sp.add_argument("image_ref", metavar="IMAGE_REF", help="image reference")
+   sp.add_argument("name", metavar="NAME", help="new image name")
 
    # storage-path
    help="print storage directory path"
